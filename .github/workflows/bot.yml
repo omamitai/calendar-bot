@@ -1,37 +1,33 @@
 name: Telegram Calendar Bot
 
 on:
-  # הפעלה ידנית מה-GitHub
   workflow_dispatch:
-
-  # הפעלה מחדש אוטומטית כל 5 שעות (GitHub Actions מוגבל ל-6 שעות)
   schedule:
     - cron: "0 */5 * * *"
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # ~5:50 שעות – קצת פחות מהמקסימום
+    timeout-minutes: 350
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # שחזור רשימת משתמשים מהרצה קודמת
-      - name: Restore users data
+      - name: Restore data
         uses: actions/cache@v4
         with:
-          path: /tmp/users.json
-          key: users-data-${{ github.run_id }}
-          restore-keys: users-data-
+          path: |
+            /tmp/users.json
+            /tmp/event_history.json
+          key: bot-data-${{ github.run_id }}
+          restore-keys: bot-data-
 
       - name: Run bot
         env:

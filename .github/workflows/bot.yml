@@ -25,7 +25,7 @@ jobs:
         with:
           path: |
             /tmp/users.json
-            /tmp/event_history.json
+            /tmp/history.json
           key: bot-data-${{ github.run_id }}
           restore-keys: bot-data-
 

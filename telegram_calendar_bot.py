@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Telegram Calendar Bot — Hebrew → Google Calendar
-GitHub Actions edition
+Telegram Calendar Bot — Production
+Hebrew free-text & screenshots → Google Calendar
 """
 
-import json, logging, os, re, sys, base64, io
+import json, logging, os, re, sys, base64, io, time, traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -12,38 +12,49 @@ from zoneinfo import ZoneInfo
 import google.generativeai as genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand,
+)
 from telegram.ext import (
     Application, CommandHandler, ConversationHandler,
     MessageHandler, CallbackQueryHandler, ContextTypes, filters,
 )
+from telegram.constants import ChatAction, ParseMode
 
 # ═══════════════════════════════════════
-#  Config (from GitHub Secrets / env)
+#  Config
 # ═══════════════════════════════════════
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL       = "gemini-flash-lite-latest"
-TIMEZONE           = "Asia/Jerusalem"
+TZ                 = "Asia/Jerusalem"
 SCOPES             = ["https://www.googleapis.com/auth/calendar"]
 USERS_FILE         = Path("/tmp/users.json")
 HISTORY_FILE       = Path("/tmp/event_history.json")
+MAX_RETRIES        = 2
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-STATE_CAL_ID = 0
+ST_CAL_ID = 0
 
 # ═══════════════════════════════════════
-#  Persistence helpers
+#  Persistence
 # ═══════════════════════════════════════
 
-def _load(path: Path) -> dict:
-    return json.loads(path.read_text("utf-8")) if path.exists() else {}
+def _load(p: Path) -> dict:
+    try:
+        return json.loads(p.read_text("utf-8")) if p.exists() else {}
+    except Exception:
+        return {}
 
-def _save(path: Path, data: dict):
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+def _save(p: Path, d: dict):
+    try:
+        p.write_text(json.dumps(d, ensure_ascii=False, indent=2), "utf-8")
+    except Exception as e:
+        log.error("Save error %s: %s", p, e)
 
 def get_cal_id(uid: int) -> str | None:
     return _load(USERS_FILE).get(str(uid))
@@ -51,35 +62,28 @@ def get_cal_id(uid: int) -> str | None:
 def set_cal_id(uid: int, cid: str):
     d = _load(USERS_FILE); d[str(uid)] = cid; _save(USERS_FILE, d)
 
-def save_event_to_history(uid: int, event_id: str, calendar_id: str, event_data: dict):
+def save_event(uid: int, event_id: str, cal_id: str, data: dict):
     h = _load(HISTORY_FILE)
-    key = str(uid)
-    if key not in h:
-        h[key] = []
-    h[key].append({
-        "event_id": event_id,
-        "calendar_id": calendar_id,
-        "data": event_data,
-        "created_at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
-    })
-    # keep last 50 per user
-    h[key] = h[key][-50:]
+    k = str(uid)
+    if k not in h: h[k] = []
+    h[k].append({"eid": event_id, "cid": cal_id, "data": data,
+                  "ts": datetime.now(ZoneInfo(TZ)).isoformat()})
+    h[k] = h[k][-50:]
     _save(HISTORY_FILE, h)
+
+def pop_event(uid: int) -> dict | None:
+    h = _load(HISTORY_FILE)
+    k = str(uid)
+    lst = h.get(k, [])
+    if not lst: return None
+    ev = lst.pop()
+    _save(HISTORY_FILE, h)
+    return ev
 
 def get_last_event(uid: int) -> dict | None:
     h = _load(HISTORY_FILE)
-    events = h.get(str(uid), [])
-    return events[-1] if events else None
-
-def pop_last_event(uid: int) -> dict | None:
-    h = _load(HISTORY_FILE)
-    key = str(uid)
-    events = h.get(key, [])
-    if not events:
-        return None
-    ev = events.pop()
-    _save(HISTORY_FILE, h)
-    return ev
+    lst = h.get(str(uid), [])
+    return lst[-1] if lst else None
 
 # ═══════════════════════════════════════
 #  Google Calendar
@@ -87,20 +91,19 @@ def pop_last_event(uid: int) -> dict | None:
 
 def init_google():
     b64 = os.environ.get("GOOGLE_SA_JSON_B64", "")
-    if not b64:
-        sys.exit("GOOGLE_SA_JSON_B64 missing")
-    sa_path = Path("/tmp/sa.json")
-    sa_path.write_bytes(base64.b64decode(b64))
-    creds = service_account.Credentials.from_service_account_file(str(sa_path), scopes=SCOPES)
-    service = build("calendar", "v3", credentials=creds)
-    email = json.loads(sa_path.read_text()).get("client_email", "?")
-    return service, email
+    if not b64: sys.exit("GOOGLE_SA_JSON_B64 missing")
+    p = Path("/tmp/sa.json")
+    p.write_bytes(base64.b64decode(b64))
+    creds = service_account.Credentials.from_service_account_file(str(p), scopes=SCOPES)
+    svc = build("calendar", "v3", credentials=creds)
+    email = json.loads(p.read_text()).get("client_email", "?")
+    return svc, email
 
 
-def create_event(svc, cal_id: str, ev: dict) -> dict:
-    tz = ZoneInfo(TIMEZONE)
+def gcal_insert(svc, cal_id: str, ev: dict) -> dict:
+    tz = ZoneInfo(TZ)
     body = {"summary": ev["title"]}
-    if ev.get("location"):   body["location"]    = ev["location"]
+    if ev.get("location"):    body["location"]    = ev["location"]
     if ev.get("description"): body["description"] = ev["description"]
 
     if ev.get("is_all_day") or not ev.get("start_time"):
@@ -114,156 +117,288 @@ def create_event(svc, cal_id: str, ev: dict) -> dict:
             if e <= s: e += timedelta(days=1)
         else:
             e = s + timedelta(hours=1)
-        body["start"] = {"dateTime": s.isoformat(), "timeZone": TIMEZONE}
-        body["end"]   = {"dateTime": e.isoformat(), "timeZone": TIMEZONE}
+        body["start"] = {"dateTime": s.isoformat(), "timeZone": TZ}
+        body["end"]   = {"dateTime": e.isoformat(), "timeZone": TZ}
 
     return svc.events().insert(calendarId=cal_id, body=body).execute()
 
 
-def delete_event(svc, cal_id: str, event_id: str):
-    svc.events().delete(calendarId=cal_id, eventId=event_id).execute()
+def gcal_delete(svc, cal_id: str, eid: str):
+    try:
+        svc.events().delete(calendarId=cal_id, eventId=eid).execute()
+    except Exception as e:
+        log.warning("Delete failed (may already be gone): %s", e)
 
 # ═══════════════════════════════════════
-#  Gemini LLM
+#  Gemini
 # ═══════════════════════════════════════
 
-PARSE_PROMPT = """\
-You are an event extraction engine. Extract calendar event details from the user input.
+TEXT_PROMPT = """\
+Extract the calendar event from the Hebrew text below.
 
 Today: {today}
 Timezone: Asia/Jerusalem
 
-Return ONLY a valid JSON object, no markdown, no explanation:
-{{
-  "title": "short title",
-  "date": "YYYY-MM-DD",
-  "start_time": "HH:MM or null",
-  "end_time": "HH:MM or null",
-  "location": "location or null",
-  "description": "extra details or null",
-  "is_all_day": true/false
-}}
+Return ONLY a JSON object — no markdown fences, no explanation, no text before or after:
 
-Day mapping: ראשון=Sun שני=Mon שלישי=Tue רביעי=Wed חמישי=Thu שישי=Fri שבת=Sat
-"מחר" = tomorrow. "יום X הבא" = next X.
-No time mentioned → is_all_day=true, start_time=null.
-JSON only!
+{{"title":"כותרת קצרה","date":"YYYY-MM-DD","start_time":"HH:MM or null","end_time":"HH:MM or null","location":"מיקום or null","description":"פרטים or null","is_all_day":true/false}}
 
-Input:
-{input}
-"""
+Rules:
+- ראשון=Sun שני=Mon שלישי=Tue רביעי=Wed חמישי=Thu שישי=Fri שבת=Sat
+- מחר=tomorrow. בעוד שבוע=+7d. יום X הבא=next X.
+- No time mentioned → is_all_day:true, start_time:null
+- Keep title short and natural in Hebrew
+- PURE JSON ONLY
 
-IMAGE_PROMPT = """\
-You are an event extraction engine. The user sent an image (screenshot, photo of a poster/flyer, WhatsApp message, etc.).
+Text: {input}"""
 
-Examine the image carefully. Extract ANY calendar event information you can find: dates, times, titles, locations.
+IMG_PROMPT = """\
+Extract the calendar event from this image (screenshot, flyer, WhatsApp message, poster, invitation).
+Find: dates, times, event names, locations.
 
-Today: {today}
-Timezone: Asia/Jerusalem
+Today: {today} | Timezone: Asia/Jerusalem
 
-Return ONLY a valid JSON object, no markdown, no explanation:
-{{
-  "title": "short title",
-  "date": "YYYY-MM-DD",
-  "start_time": "HH:MM or null",
-  "end_time": "HH:MM or null",
-  "location": "location or null",
-  "description": "extra details or null",
-  "is_all_day": true/false
-}}
+Return ONLY a JSON object — no markdown, no text:
 
-If the image contains Hebrew, interpret it. If you see multiple events, extract the FIRST/MAIN one.
-JSON only!
-"""
+{{"title":"כותרת קצרה","date":"YYYY-MM-DD","start_time":"HH:MM or null","end_time":"HH:MM or null","location":"מיקום or null","description":"פרטים or null","is_all_day":true/false}}
+
+Hebrew title. Main event only. PURE JSON ONLY."""
+
+DATE_PROMPT = """Today is {today}. Convert "{input}" to a date. Reply with ONLY YYYY-MM-DD, nothing else."""
 
 
 def init_gemini():
     genai.configure(api_key=GEMINI_API_KEY)
     return genai.GenerativeModel(
         GEMINI_MODEL,
-        generation_config={"temperature": 0.1, "max_output_tokens": 2048},
+        generation_config={"temperature": 0.05, "max_output_tokens": 1024},
     )
 
 
-def _clean_json(raw: str) -> dict:
+def _extract_json(raw: str) -> dict:
+    """Robust JSON extraction — handles fences, preamble, trailing text."""
     raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+    # Try raw first
+    try: return json.loads(raw)
+    except Exception: pass
+    # Strip markdown fences
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    try: return json.loads(cleaned.strip())
+    except Exception: pass
+    # Find first { ... } block
+    m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+    if m:
+        try: return json.loads(m.group())
+        except Exception: pass
+    # Find nested { ... { ... } ... }
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try: return json.loads(m.group())
+        except Exception: pass
+    raise ValueError(f"No JSON found in: {raw[:120]}")
 
 
-def parse_text(model, text: str) -> dict:
-    today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d (%A)")
-    resp = model.generate_content(PARSE_PROMPT.format(today=today, input=text))
-    return _clean_json(resp.text)
+def _gemini_call(model, content, retries=MAX_RETRIES):
+    """Call Gemini with retry."""
+    for attempt in range(retries + 1):
+        try:
+            r = model.generate_content(content)
+            if r and r.text:
+                return r.text
+        except Exception as e:
+            log.warning("Gemini attempt %d: %s", attempt + 1, e)
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError("Gemini failed after retries")
 
 
-def parse_image(model, image_bytes: bytes, caption: str = "") -> dict:
-    today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d (%A)")
-    prompt = IMAGE_PROMPT.format(today=today)
-    if caption:
-        prompt += f"\n\nUser also wrote: {caption}"
+def llm_text(model, text: str) -> dict:
+    today = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d (%A)")
+    raw = _gemini_call(model, TEXT_PROMPT.format(today=today, input=text))
+    return _extract_json(raw)
 
+
+def llm_image(model, img_bytes: bytes, caption: str = "") -> dict:
     import PIL.Image
-    img = PIL.Image.open(io.BytesIO(image_bytes))
+    today = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d (%A)")
+    prompt = IMG_PROMPT.format(today=today)
+    if caption: prompt += f"\n\nUser note: {caption}"
+    img = PIL.Image.open(io.BytesIO(img_bytes))
+    raw = _gemini_call(model, [prompt, img])
+    return _extract_json(raw)
 
-    resp = model.generate_content([prompt, img])
-    return _clean_json(resp.text)
+
+def llm_parse_date(model, text: str) -> str | None:
+    today = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d (%A)")
+    try:
+        raw = _gemini_call(model, DATE_PROMPT.format(today=today, input=text))
+        raw = raw.strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+            datetime.strptime(raw, "%Y-%m-%d")  # validate
+            return raw
+    except Exception:
+        pass
+    return None
+
+# ═══════════════════════════════════════
+#  Validation
+# ═══════════════════════════════════════
+
+def validate_event(ev: dict) -> str | None:
+    """Returns error string or None if valid."""
+    if not ev.get("title"):
+        return "חסרה כותרת לאירוע"
+    if not ev.get("date"):
+        return "חסר תאריך"
+    try:
+        datetime.strptime(ev["date"], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return "תאריך לא תקין"
+    if ev.get("start_time"):
+        if not re.match(r"^\d{1,2}:\d{2}$", ev["start_time"]):
+            return "שעת התחלה לא תקינה"
+    if ev.get("end_time"):
+        if not re.match(r"^\d{1,2}:\d{2}$", ev["end_time"]):
+            ev["end_time"] = None  # silently fix
+    return None
 
 # ═══════════════════════════════════════
 #  Formatting
 # ═══════════════════════════════════════
+
+R = "\u200F"
 
 _DAYS = {
     "Sunday": "ראשון", "Monday": "שני", "Tuesday": "שלישי",
     "Wednesday": "רביעי", "Thursday": "חמישי",
     "Friday": "שישי", "Saturday": "שבת",
 }
+_MONTHS = {
+    1: "ינואר", 2: "פברואר", 3: "מרץ", 4: "אפריל",
+    5: "מאי", 6: "יוני", 7: "יולי", 8: "אוגוסט",
+    9: "ספטמבר", 10: "אוקטובר", 11: "נובמבר", 12: "דצמבר",
+}
 
-def _fmt_date(date_str: str) -> str:
-    d = datetime.strptime(date_str, "%Y-%m-%d")
-    day = _DAYS.get(d.strftime("%A"), "")
-    return f"{d.strftime('%d.%m.%Y')} · יום {day}"
 
-def _fmt_time(ev: dict) -> str:
+def _he_date(ds: str) -> str:
+    d = datetime.strptime(ds, "%Y-%m-%d")
+    return f"יום {_DAYS.get(d.strftime('%A'), '')}, {d.day} ב{_MONTHS.get(d.month, '')} {d.year}"
+
+
+def _he_time(ev: dict) -> str:
     if ev.get("is_all_day") or not ev.get("start_time"):
         return "כל היום"
-    t = ev["start_time"]
+    s = ev["start_time"]
     if ev.get("end_time"):
-        t += f" — {ev['end_time']}"
-    return t
+        return f"{s} – {ev['end_time']}"
+    return s
 
-def fmt_event_card(ev: dict, link: str = "") -> str:
-    """Professional event confirmation card."""
+
+def _relative_date(ds: str) -> str:
+    """Returns 'מחר', 'היום', or '' for context."""
+    try:
+        d = datetime.strptime(ds, "%Y-%m-%d").date()
+        today = datetime.now(ZoneInfo(TZ)).date()
+        if d == today: return " (היום)"
+        if d == today + timedelta(days=1): return " (מחר)"
+        if d == today + timedelta(days=2): return " (מחרתיים)"
+    except Exception:
+        pass
+    return ""
+
+
+def card_confirmed(ev: dict, link: str = "") -> str:
+    """Event created — clean confirmation."""
+    rel = _relative_date(ev["date"])
     lines = [
-        "╭───────────────────────╮",
-        f"  ✓  <b>{ev['title']}</b>",
-        "╰───────────────────────╯",
+        f"{R}✅  <b>נוסף ליומן</b>",
         "",
-        f"  📅  {_fmt_date(ev['date'])}",
-        f"  🕐  {_fmt_time(ev)}",
+        f"{R}     <b>{ev['title']}</b>",
+        f"{R}     ─────────────────",
+        f"{R}     📅  {_he_date(ev['date'])}{rel}",
+        f"{R}     🕐  {_he_time(ev)}",
     ]
     if ev.get("location"):
-        lines.append(f"  📍  {ev['location']}")
+        lines.append(f"{R}     📍  {ev['location']}")
     if ev.get("description"):
-        lines.append(f"  📝  {ev['description']}")
+        lines.append(f"{R}     📝  {ev['description']}")
     if link:
-        lines += ["", f"  <a href=\"{link}\">פתח ב-Google Calendar →</a>"]
+        lines += ["", f"{R}     <a href=\"{link}\">פתח ביומן ←</a>"]
     return "\n".join(lines)
 
 
-def fmt_preview_card(ev: dict) -> str:
-    """Preview before confirming (used in undo context)."""
+def card_editing(ev: dict) -> str:
+    """Preview card during edit — shows what will be saved."""
+    rel = _relative_date(ev["date"])
     lines = [
-        f"<b>{ev['title']}</b>",
-        f"📅 {_fmt_date(ev['date'])}  ·  🕐 {_fmt_time(ev)}",
+        f"{R}✏️  <b>עריכת אירוע</b>",
+        "",
+        f"{R}     <b>{ev['title']}</b>",
+        f"{R}     ─────────────────",
+        f"{R}     📅  {_he_date(ev['date'])}{rel}",
+        f"{R}     🕐  {_he_time(ev)}",
     ]
     if ev.get("location"):
-        lines.append(f"📍 {ev['location']}")
+        lines.append(f"{R}     📍  {ev['location']}")
+    if ev.get("description"):
+        lines.append(f"{R}     📝  {ev['description']}")
+    lines += ["", f"{R}<i>לחץ על שדה לעריכה, או אשר:</i>"]
     return "\n".join(lines)
+
+
+def card_cancelled(title: str) -> str:
+    return f"{R}🗑  <s>{title}</s>  ·  בוטל"
+
+
+def card_error(msg: str) -> str:
+    return f"{R}⚠️  {msg}"
 
 # ═══════════════════════════════════════
-#  Telegram Handlers
+#  Keyboards
+# ═══════════════════════════════════════
+
+def kb_post_create() -> InlineKeyboardMarkup:
+    """After event is created — undo + edit."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"✏️ ערוך", callback_data="act:edit"),
+            InlineKeyboardButton(f"🗑 בטל", callback_data="act:undo"),
+        ],
+    ])
+
+
+def kb_edit(ev: dict) -> InlineKeyboardMarkup:
+    """Edit mode — field buttons + save."""
+    buttons = [
+        [
+            InlineKeyboardButton(f"שם", callback_data="ed:title"),
+            InlineKeyboardButton(f"תאריך", callback_data="ed:date"),
+            InlineKeyboardButton(f"שעה", callback_data="ed:time"),
+        ],
+    ]
+    if ev.get("location"):
+        buttons[0].append(InlineKeyboardButton("מיקום", callback_data="ed:location"))
+    buttons.append([
+        InlineKeyboardButton(f"✅ שמור שינויים", callback_data="ed:save"),
+        InlineKeyboardButton(f"↩️ בטל הכל", callback_data="act:undo"),
+    ])
+    return buttons_to_markup(buttons)
+
+
+def buttons_to_markup(buttons):
+    return InlineKeyboardMarkup(buttons)
+
+
+BOT_COMMANDS = [
+    BotCommand("start",  "חיבור ליומן"),
+    BotCommand("undo",   "ביטול אירוע אחרון"),
+    BotCommand("setup",  "שינוי יומן"),
+    BotCommand("help",   "עזרה"),
+]
+
+# ═══════════════════════════════════════
+#  Handlers
 # ═══════════════════════════════════════
 
 def build_app(cal_svc, sa_email, gemini_mdl):
@@ -272,45 +407,52 @@ def build_app(cal_svc, sa_email, gemini_mdl):
 
     async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         uid = update.effective_user.id
+        name = update.effective_user.first_name or ""
+
         if get_cal_id(uid):
-            name = update.effective_user.first_name or ""
             await update.message.reply_text(
-                f"👋  <b>{name}, הבוט מוכן.</b>\n\n"
-                "שלח הודעה או צילום מסך — אוסיף ליומן.\n\n"
-                "<code>/setup</code> לשינוי יומן  ·  <code>/help</code> לעזרה",
-                parse_mode="HTML",
+                f"{R}👋  <b>{name}</b>, הבוט מוכן.\n\n"
+                f"{R}שלח הודעה או תמונה — ואני מוסיף ליומן.\n"
+                f"{R}לשינוי יומן — /setup  ·  לעזרה — /help",
+                parse_mode=ParseMode.HTML,
             )
             return ConversationHandler.END
 
         await update.message.reply_text(
-            "👋  <b>שלום! בוא נחבר את היומן.</b>\n\n"
-            "① שתף את היומן עם הכתובת:\n"
+            f"{R}👋  <b>שלום {name}!</b>\n\n"
+            f"{R}אני מוסיף אירועים ל-Google Calendar.\n"
+            f"{R}כתוב בעברית או שלח תמונה — אני מטפל בשאר.\n\n"
+            f"─────────────────────────\n\n"
+            f"{R}<b>הגדרה חד-פעמית:</b>\n\n"
+            f"{R}<b>①</b>  שתף את היומן שלך עם:\n"
             f"<code>{sa_email}</code>\n\n"
-            "<i>Google Calendar → ⚙️ ליד היומן → שיתוף</i>\n"
-            "<i>→ הרשאה: ביצוע שינויים באירועים</i>\n\n"
-            "② שלח לי את כתובת ה-Gmail:",
-            parse_mode="HTML",
+            f"{R}<i>Google Calendar → ⚙️ ליד היומן</i>\n"
+            f"{R}<i>→ שיתוף עם אנשים ספציפיים</i>\n"
+            f"{R}<i>→ הרשאה: ביצוע שינויים באירועים</i>\n\n"
+            f"{R}<b>②</b>  שלח לי את כתובת ה-Gmail:",
+            parse_mode=ParseMode.HTML,
         )
-        return STATE_CAL_ID
+        return ST_CAL_ID
 
     async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
-            "🔧  <b>הגדרת יומן</b>\n\n"
-            f"ודא שיתוף עם: <code>{sa_email}</code>\n"
-            "שלח Calendar ID:",
-            parse_mode="HTML",
+            f"{R}⚙️  <b>החלפת יומן</b>\n\n"
+            f"{R}ודא שיתוף עם:\n<code>{sa_email}</code>\n\n"
+            f"{R}שלח כתובת Gmail:",
+            parse_mode=ParseMode.HTML,
         )
-        return STATE_CAL_ID
+        return ST_CAL_ID
 
     async def recv_cal_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         text = update.message.text.strip()
         if "@" not in text:
             await update.message.reply_text(
-                "✖  לא נראה כמו כתובת תקינה. נסה שוב:"
+                f"{R}נסה כתובת Gmail, למשל:\n<code>name@gmail.com</code>",
+                parse_mode=ParseMode.HTML,
             )
-            return STATE_CAL_ID
+            return ST_CAL_ID
 
-        msg = await update.message.reply_text("⠋ בודק גישה…")
+        await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
         try:
             cal_svc.calendarList().insert(body={"id": text}).execute()
@@ -320,239 +462,365 @@ def build_app(cal_svc, sa_email, gemini_mdl):
         try:
             cal_svc.events().list(calendarId=text, maxResults=1, singleEvents=True).execute()
         except Exception as exc:
-            await msg.edit_text(
-                "✖  <b>אין גישה ליומן.</b>\n\n"
-                f"ודא שיתוף עם:\n<code>{sa_email}</code>\n\n"
-                f"<i>{str(exc)[:100]}</i>",
-                parse_mode="HTML",
+            await update.message.reply_text(
+                f"{R}⚠️  <b>אין גישה ליומן.</b>\n\n"
+                f"{R}ודא:\n"
+                f"{R}  · שיתפת עם <code>{sa_email}</code>\n"
+                f"{R}  · הרשאת ביצוע שינויים\n\n"
+                f"<code>{str(exc)[:90]}</code>",
+                parse_mode=ParseMode.HTML,
             )
-            return STATE_CAL_ID
+            return ST_CAL_ID
 
         set_cal_id(update.effective_user.id, text)
-        await msg.edit_text(
-            f"✓  <b>יומן מחובר:</b> <code>{text}</code>\n\n"
-            "שלח אירוע בעברית או צילום מסך — ואני מוסיף ליומן.",
-            parse_mode="HTML",
+        await update.message.reply_text(
+            f"{R}✅  <b>מחובר!</b>  <code>{text}</code>\n\n"
+            f"{R}שלח אירוע בעברית או צילום מסך.",
+            parse_mode=ParseMode.HTML,
         )
         return ConversationHandler.END
 
-    # ── Help / Status ──
+    # ── Help ──
 
     async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "<b>📅  בוט יומן — עזרה</b>\n\n"
+            f"{R}<b>עזרה</b>\n\n"
 
-            "<b>טקסט</b> — כתוב אירוע בשפה חופשית:\n"
-            "<i>  \"פגישה עם דני מחר ב-10 בבוקר\"</i>\n"
-            "<i>  \"יום הולדת יעל 25 אפריל\"</i>\n"
-            "<i>  \"הרצאה יום חמישי 14:00–16:00\"</i>\n\n"
+            f"{R}<b>✍️  טקסט</b>\n"
+            f"{R}<i>\"פגישה עם דני מחר ב-10 בקפה ביאליק\"</i>\n"
+            f"{R}<i>\"יום הולדת יעל 25 אפריל\"</i>\n"
+            f"{R}<i>\"הרצאה יום חמישי 14:00–16:00\"</i>\n\n"
 
-            "<b>תמונה</b> — שלח צילום מסך, פלייר, או הודעת WhatsApp.\n"
-            "אזהה אוטומטית את פרטי האירוע.\n\n"
+            f"{R}<b>📸  תמונה</b>\n"
+            f"{R}צילום מסך, פלייר, הודעת WhatsApp\n\n"
 
-            "<b>ביטול</b> — אחרי כל אירוע אפשר ללחוץ \"בטל\" או לשלוח /undo.\n\n"
+            f"{R}<b>✏️  עריכה</b>\n"
+            f"{R}אחרי הוספה — לחץ ✏️ לשנות פרטים\n\n"
 
-            "<b>פקודות</b>\n"
-            "/start · /setup · /help · /status · /undo",
-            parse_mode="HTML",
+            f"{R}<b>🗑  ביטול</b>\n"
+            f"{R}כפתור מתחת לאירוע, או /undo\n\n"
+
+            f"─────────────────────────\n"
+            f"{R}/start · /setup · /undo · /help",
+            parse_mode=ParseMode.HTML,
         )
-
-    async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        cid = get_cal_id(update.effective_user.id)
-        if cid:
-            await update.message.reply_text(
-                f"<b>סטטוס</b>\n\n"
-                f"📅  <code>{cid}</code>\n"
-                f"🤖  <code>{GEMINI_MODEL}</code>\n"
-                f"✓  פעיל",
-                parse_mode="HTML",
-            )
-        else:
-            await update.message.reply_text("לא מחובר. שלח /start.")
 
     # ── Undo ──
 
     async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await _do_undo(update.effective_user.id, update.message.reply_text)
-
-    async def callback_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-
-        uid = query.from_user.id
-        ev = pop_last_event(uid)
+        uid = update.effective_user.id
+        ev = pop_event(uid)
         if not ev:
-            await query.edit_message_reply_markup(reply_markup=None)
-            await query.message.reply_text("אין מה לבטל.")
+            await update.message.reply_text(f"{R}אין מה לבטל.")
             return
+        gcal_delete(cal_svc, ev["cid"], ev["eid"])
+        await update.message.reply_text(
+            card_cancelled(ev["data"].get("title", "?")),
+            parse_mode=ParseMode.HTML,
+        )
 
-        try:
-            delete_event(cal_svc, ev["calendar_id"], ev["event_id"])
-            # Edit the original message to show it was cancelled
-            title = ev["data"].get("title", "?")
-            await query.edit_message_text(
-                f"<s>{title}</s>  —  <b>בוטל ✓</b>",
-                parse_mode="HTML",
-            )
-        except Exception as exc:
-            log.exception("Delete failed")
-            await query.edit_message_reply_markup(reply_markup=None)
-            await query.message.reply_text(f"שגיאה במחיקה: {exc}")
+    # ── Create event (auto-add) ──
 
-    async def _do_undo(uid: int, reply_fn):
-        ev = pop_last_event(uid)
-        if not ev:
-            await reply_fn("אין אירוע אחרון לביטול.")
-            return
-        try:
-            delete_event(cal_svc, ev["calendar_id"], ev["event_id"])
-            title = ev["data"].get("title", "?")
-            await reply_fn(
-                f"<s>{title}</s>  —  <b>בוטל ✓</b>",
-                parse_mode="HTML",
-            )
-        except Exception as exc:
-            log.exception("Delete failed")
-            await reply_fn(f"שגיאה: {exc}")
-
-    # ── Core: process parsed event ──
-
-    async def _process_event(uid: int, ev: dict, edit_msg) -> None:
-        """Validate, create event, send confirmation."""
+    async def _create_and_confirm(uid: int, ev: dict, reply_fn, edit_fn=None):
+        """
+        Create event in Google Calendar immediately, then show confirmation.
+        reply_fn: for new messages.  edit_fn: for editing existing message.
+        """
         cal_id = get_cal_id(uid)
         if not cal_id:
-            await edit_msg("שלח /start קודם.")
+            fn = edit_fn or reply_fn
+            await fn(f"{R}שלח /start כדי לחבר את היומן.")
             return
 
-        if not ev.get("title") or not ev.get("date"):
-            await edit_msg("✖  לא זיהיתי כותרת או תאריך. נסה שוב.")
-            return
-
-        # Validate date format
-        try:
-            datetime.strptime(ev["date"], "%Y-%m-%d")
-        except ValueError:
-            await edit_msg("✖  תאריך לא תקין. נסה שוב.")
+        err = validate_event(ev)
+        if err:
+            fn = edit_fn or reply_fn
+            await fn(card_error(err), parse_mode=ParseMode.HTML)
             return
 
         try:
-            created = create_event(cal_svc, cal_id, ev)
+            created = gcal_insert(cal_svc, cal_id, ev)
         except Exception as exc:
-            log.exception("Calendar create error")
-            await edit_msg(f"✖  שגיאה ביומן: {exc}")
+            log.exception("Calendar insert error")
+            fn = edit_fn or reply_fn
+            await fn(card_error(f"שגיאה ביומן: {str(exc)[:80]}"), parse_mode=ParseMode.HTML)
             return
 
-        event_id = created.get("id", "")
+        eid = created.get("id", "")
         link = created.get("htmlLink", "")
+        save_event(uid, eid, cal_id, ev)
 
-        save_event_to_history(uid, event_id, cal_id, ev)
+        text = card_confirmed(ev, link)
+        kb = kb_post_create()
 
-        card = fmt_event_card(ev, link)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("↩ בטל אירוע", callback_data="undo")]
-        ])
+        if edit_fn:
+            await edit_fn(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await reply_fn(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-        await edit_msg(card, parse_mode="HTML", reply_markup=keyboard)
+    # ── Callback: undo ──
+
+    async def cb_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        uid = q.from_user.id
+
+        # If in edit mode — cancel edits AND delete the original event
+        pending = ctx.user_data.pop("editing_event", None)
+        orig_eid = ctx.user_data.pop("editing_original_eid", None)
+        orig_cid = ctx.user_data.pop("editing_original_cid", None)
+        ctx.user_data.pop("edit_msg_id", None)
+        ctx.user_data.pop("edit_field", None)
+        if pending:
+            if orig_eid and orig_cid:
+                gcal_delete(cal_svc, orig_cid, orig_eid)
+                pop_event(uid)
+            title = pending.get("title", "?")
+            await q.edit_message_text(card_cancelled(title), parse_mode=ParseMode.HTML)
+            return
+
+        ev = pop_event(uid)
+        if not ev:
+            await q.edit_message_text(f"{R}אין מה לבטל.", parse_mode=ParseMode.HTML)
+            return
+        gcal_delete(cal_svc, ev["cid"], ev["eid"])
+        await q.edit_message_text(
+            card_cancelled(ev["data"].get("title", "?")),
+            parse_mode=ParseMode.HTML,
+        )
+
+    # ── Callback: enter edit mode ──
+
+    async def cb_enter_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        uid = q.from_user.id
+
+        last = get_last_event(uid)
+        if not last:
+            await q.edit_message_text(f"{R}אין אירוע לעריכה.", parse_mode=ParseMode.HTML)
+            return
+
+        ev = dict(last["data"])  # copy
+        ctx.user_data["editing_event"] = ev
+        ctx.user_data["editing_original_eid"] = last["eid"]
+        ctx.user_data["editing_original_cid"] = last["cid"]
+        ctx.user_data["edit_msg_id"] = q.message.message_id
+
+        await q.edit_message_text(
+            card_editing(ev),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_edit(ev),
+        )
+
+    # ── Callback: pick field to edit ──
+
+    async def cb_edit_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        field = q.data.split(":")[1]
+        ctx.user_data["edit_field"] = field
+
+        hints = {
+            "title":    "שלח שם חדש לאירוע:",
+            "date":     "שלח תאריך חדש (למשל: מחר, 25.3, יום חמישי):",
+            "time":     "שלח שעה חדשה (למשל: 10:00 או 14:00-16:00):",
+            "location": "שלח מיקום חדש:",
+        }
+        await q.message.reply_text(f"{R}✏️  {hints.get(field, 'שלח ערך חדש:')}")
+
+    # ── Callback: save edits ──
+
+    async def cb_save_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        uid = q.from_user.id
+
+        ev = ctx.user_data.pop("editing_event", None)
+        orig_eid = ctx.user_data.pop("editing_original_eid", None)
+        orig_cid = ctx.user_data.pop("editing_original_cid", None)
+        ctx.user_data.pop("edit_msg_id", None)
+
+        if not ev:
+            await q.edit_message_text(f"{R}אין שינויים לשמור.", parse_mode=ParseMode.HTML)
+            return
+
+        # Delete old event
+        if orig_eid and orig_cid:
+            gcal_delete(cal_svc, orig_cid, orig_eid)
+            # Also remove from history
+            pop_event(uid)
+
+        # Create updated event
+        await _create_and_confirm(uid, ev, q.message.reply_text, q.edit_message_text)
+
+    # ── Handle text input during edit ──
+
+    async def _try_handle_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+        """If in edit mode, apply the field change. Returns True if handled."""
+        field = ctx.user_data.pop("edit_field", None)
+        ev = ctx.user_data.get("editing_event")
+        if not field or not ev:
+            return False
+
+        text = update.message.text.strip()
+
+        if field == "title":
+            ev["title"] = text
+
+        elif field == "location":
+            ev["location"] = text
+
+        elif field == "time":
+            parts = re.split(r"[-–—]", text)
+            t = parts[0].strip().replace(".", ":")
+            # Normalize single-digit hour: "9:00" → "09:00"
+            m = re.match(r"^(\d{1,2}):(\d{2})$", t)
+            if m:
+                ev["start_time"] = f"{int(m.group(1)):02d}:{m.group(2)}"
+                ev["is_all_day"] = False
+                if len(parts) > 1:
+                    t2 = parts[1].strip().replace(".", ":")
+                    m2 = re.match(r"^(\d{1,2}):(\d{2})$", t2)
+                    if m2:
+                        ev["end_time"] = f"{int(m2.group(1)):02d}:{m2.group(2)}"
+                    else:
+                        ev["end_time"] = None
+                else:
+                    ev["end_time"] = None
+            else:
+                await update.message.reply_text(
+                    f"{R}פורמט לא תקין. נסה: <code>10:00</code> או <code>14:00-16:00</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                ctx.user_data["edit_field"] = field  # keep in edit mode
+                return True
+
+        elif field == "date":
+            # Try DD.MM or DD.MM.YYYY
+            dm = re.match(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", text)
+            if dm:
+                day, month = int(dm.group(1)), int(dm.group(2))
+                year = int(dm.group(3)) if dm.group(3) else datetime.now(ZoneInfo(TZ)).year
+                if year < 100: year += 2000
+                ev["date"] = f"{year}-{month:02d}-{day:02d}"
+            else:
+                parsed = llm_parse_date(gemini_mdl, text)
+                if parsed:
+                    ev["date"] = parsed
+                else:
+                    await update.message.reply_text(
+                        f"{R}לא הבנתי את התאריך. נסה: <code>25.3</code> או <code>מחר</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    ctx.user_data["edit_field"] = field
+                    return True
+
+        ctx.user_data["editing_event"] = ev
+
+        # Update the edit card
+        try:
+            msg_id = ctx.user_data.get("edit_msg_id")
+            if msg_id:
+                await ctx.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=msg_id,
+                    text=card_editing(ev),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_edit(ev),
+                )
+        except Exception as e:
+            log.warning("Could not update edit card: %s", e)
+
+        await update.message.reply_text(f"{R}✓ עודכן.")
+        return True
 
     # ── Text handler ──
 
     async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        # Edit mode takes priority
+        if await _try_handle_edit(update, ctx):
+            return
+
         text = update.message.text.strip()
         if not text:
             return
+
         uid = update.effective_user.id
         if not get_cal_id(uid):
-            await update.message.reply_text("שלח /start כדי להתחיל.")
+            await update.message.reply_text(
+                f"{R}שלח /start כדי לחבר את היומן."
+            )
             return
 
-        msg = await update.message.reply_text("⠋")
+        await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
         try:
-            ev = parse_text(gemini_mdl, text)
-        except json.JSONDecodeError:
-            await msg.edit_text("✖  לא הצלחתי לפענח. נסה ניסוח אחר.")
-            return
+            ev = llm_text(gemini_mdl, text)
         except Exception as exc:
-            log.exception("Gemini text error")
-            await msg.edit_text(f"✖  שגיאה: {str(exc)[:100]}")
+            log.exception("LLM text error")
+            await update.message.reply_text(
+                f"{R}לא הצלחתי לפענח. נסה ניסוח אחר:\n"
+                f"<i>\"פגישה עם דני מחר ב-10\"</i>",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
-        await _process_event(uid, ev, msg.edit_text)
+        # Auto-add to calendar
+        await _create_and_confirm(uid, ev, update.message.reply_text)
 
     # ── Image handler ──
 
-    async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def _handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE, img_bytes: bytes, caption: str):
         uid = update.effective_user.id
         if not get_cal_id(uid):
-            await update.message.reply_text("שלח /start כדי להתחיל.")
+            await update.message.reply_text(f"{R}שלח /start קודם.")
             return
 
-        msg = await update.message.reply_text("⠋ מנתח תמונה…")
+        await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
-        # Get the highest resolution photo
+        try:
+            ev = llm_image(gemini_mdl, img_bytes, caption)
+        except Exception as exc:
+            log.exception("LLM image error")
+            await update.message.reply_text(
+                f"{R}לא הצלחתי לזהות אירוע בתמונה.\n"
+                f"{R}נסה תמונה ברורה יותר, או כתוב בטקסט.",
+            )
+            return
+
+        await _create_and_confirm(uid, ev, update.message.reply_text)
+
+    async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         photo = update.message.photo[-1]
         file = await ctx.bot.get_file(photo.file_id)
         buf = io.BytesIO()
         await file.download_to_memory(buf)
-        image_bytes = buf.getvalue()
+        await _handle_photo(update, ctx, buf.getvalue(), update.message.caption or "")
 
-        caption = update.message.caption or ""
-
-        try:
-            ev = parse_image(gemini_mdl, image_bytes, caption)
-        except json.JSONDecodeError:
-            await msg.edit_text(
-                "✖  לא הצלחתי לחלץ אירוע מהתמונה.\n"
-                "נסה תמונה ברורה יותר או כתוב את הפרטים בטקסט."
-            )
-            return
-        except Exception as exc:
-            log.exception("Gemini image error")
-            await msg.edit_text(f"✖  שגיאה: {str(exc)[:100]}")
-            return
-
-        await _process_event(uid, ev, msg.edit_text)
-
-    # ── Document/file image handler (for uncompressed photos) ──
-
-    async def handle_document_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def handle_doc_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         doc = update.message.document
         if not doc.mime_type or not doc.mime_type.startswith("image/"):
-            return  # ignore non-image files
-
-        uid = update.effective_user.id
-        if not get_cal_id(uid):
-            await update.message.reply_text("שלח /start כדי להתחיל.")
             return
-
-        msg = await update.message.reply_text("⠋ מנתח תמונה…")
-
         file = await ctx.bot.get_file(doc.file_id)
         buf = io.BytesIO()
         await file.download_to_memory(buf)
-        image_bytes = buf.getvalue()
-        caption = update.message.caption or ""
+        await _handle_photo(update, ctx, buf.getvalue(), update.message.caption or "")
 
-        try:
-            ev = parse_image(gemini_mdl, image_bytes, caption)
-        except json.JSONDecodeError:
-            await msg.edit_text("✖  לא הצלחתי לחלץ אירוע מהתמונה.")
-            return
-        except Exception as exc:
-            log.exception("Gemini doc-image error")
-            await msg.edit_text(f"✖  שגיאה: {str(exc)[:100]}")
-            return
-
-        await _process_event(uid, ev, msg.edit_text)
-
-    # ── Error handler ──
+    # ── Error ──
 
     async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-        log.error("Unhandled:", exc_info=ctx.error)
+        log.error("Unhandled: %s", traceback.format_exception(ctx.error))
 
-    # ── Build application ──
+    # ── Post-init ──
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    async def post_init(application: Application):
+        await application.bot.set_my_commands(BOT_COMMANDS)
+        log.info("Commands menu set")
+
+    # ── Build ──
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(ConversationHandler(
         entry_points=[
@@ -560,20 +828,24 @@ def build_app(cal_svc, sa_email, gemini_mdl):
             CommandHandler("setup", cmd_setup),
         ],
         states={
-            STATE_CAL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_cal_id)],
+            ST_CAL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_cal_id)],
         },
         fallbacks=[CommandHandler("help", cmd_help)],
     ))
 
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("undo",   cmd_undo))
-    app.add_handler(CallbackQueryHandler(callback_undo, pattern="^undo$"))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_image))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_error_handler(on_error)
+    app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("undo",  cmd_undo))
 
+    app.add_handler(CallbackQueryHandler(cb_undo,       pattern="^act:undo$"))
+    app.add_handler(CallbackQueryHandler(cb_enter_edit,  pattern="^act:edit$"))
+    app.add_handler(CallbackQueryHandler(cb_edit_field,  pattern="^ed:(title|date|time|location)$"))
+    app.add_handler(CallbackQueryHandler(cb_save_edit,   pattern="^ed:save$"))
+
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_doc_image))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.add_error_handler(on_error)
     return app
 
 # ═══════════════════════════════════════
@@ -581,9 +853,8 @@ def build_app(cal_svc, sa_email, gemini_mdl):
 # ═══════════════════════════════════════
 
 def main():
-    for var in ("TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY", "GOOGLE_SA_JSON_B64"):
-        if not os.environ.get(var):
-            sys.exit(f"Missing: {var}")
+    for v in ("TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY", "GOOGLE_SA_JSON_B64"):
+        if not os.environ.get(v): sys.exit(f"Missing: {v}")
 
     cal_svc, sa_email = init_google()
     gemini_mdl = init_gemini()
@@ -592,7 +863,6 @@ def main():
     app = build_app(cal_svc, sa_email, gemini_mdl)
     log.info("Bot starting…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()

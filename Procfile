@@ -1,1 +1,1 @@
-web: python telegram_calendar_bot.py
+worker: python telegram_calendar_bot.py
